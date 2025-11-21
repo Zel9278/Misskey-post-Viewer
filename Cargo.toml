@@ -1,0 +1,56 @@
+[package]
+name = "misskey_post_viewer"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "misskey_post_viewer"
+path = "src/main.rs"
+
+[profile.release]
+strip = true
+lto = true
+
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+tokio-tungstenite = { version = "0.20", features = ["native-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+futures = "0.3"
+url = "2.4"
+config = "0.15.19"
+eframe = { version = "0.33.2", default-features = true, features = ["glow"] }
+egui = "0.33.2"
+raw-window-handle = "0.6.2"
+crossbeam-channel = "0.5.15"
+
+[dependencies.windows]
+version = "0.62.2"
+features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_UI_Shell",
+]
+
+[dependencies.rand]
+version = "0.9.2"
+
+[dependencies.tray-icon]
+version = "0.14"
+
+[dependencies.reqwest]
+version = "0.12"
+features = ["blocking", "json"]
+
+[dependencies.image]
+version = "0.25"
+features = ["gif"]
+
+[dependencies.egui_extras]
+version = "0.33.2"
+features = ["image"]
