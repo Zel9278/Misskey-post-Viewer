@@ -318,16 +318,12 @@ impl MisskeyViewerApp {
                                                             all_text.push(' ');
                                                             all_text.push_str(&name);
                                                             
-                                                            let emoji_names: Vec<String> = all_text
-                                                                .split(':')
-                                                                .enumerate()
-                                                                .filter_map(|(i, part)| {
-                                                                    if i % 2 == 1 && !part.is_empty() {
-                                                                        Some(part.to_string())
-                                                                    } else {
-                                                                        None
-                                                                    }
-                                                                })
+                                                            // 正規表現で:emoji_name:パターンを抽出
+                                                            use regex::Regex;
+                                                            let emoji_pattern = Regex::new(r":([a-zA-Z0-9_]+):").unwrap();
+                                                            let emoji_names: Vec<String> = emoji_pattern
+                                                                .captures_iter(&all_text)
+                                                                .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string()))
                                                                 .collect();
                                                             
                                                             for emoji_name in emoji_names {
@@ -385,16 +381,10 @@ impl MisskeyViewerApp {
                                                                 renote_text_for_emoji.push(' ');
                                                                 renote_text_for_emoji.push_str(&orig_name);
                                                                 
-                                                                let renote_emoji_names: Vec<String> = renote_text_for_emoji
-                                                                    .split(':')
-                                                                    .enumerate()
-                                                                    .filter_map(|(i, part)| {
-                                                                        if i % 2 == 1 && !part.is_empty() {
-                                                                            Some(part.to_string())
-                                                                        } else {
-                                                                            None
-                                                                        }
-                                                                    })
+                                                                // 正規表現で:emoji_name:パターンを抽出
+                                                                let renote_emoji_names: Vec<String> = emoji_pattern
+                                                                    .captures_iter(&renote_text_for_emoji)
+                                                                    .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string()))
                                                                     .collect();
                                                                 
                                                                 for emoji_name in renote_emoji_names {
@@ -996,9 +986,11 @@ impl eframe::App for MisskeyViewerApp {
                 segments.push((false, current_text, None));
             }
             
-            // セグメントごとに描画
+            // セグメントごとに描画（改行を考慮）
             let font_id = egui::FontId::proportional(24.0);
+            let line_height = 28.0; // 行の高さ
             let mut current_x = comment.x;
+            let mut current_line = 0;
             
             for (is_emoji, content, emoji_info) in segments {
                 if is_emoji {
@@ -1022,7 +1014,7 @@ impl eframe::App for MisskeyViewerApp {
                             let emoji_y_offset = 3.0; // フォントのディセンダーを考慮した調整
                             
                             let emoji_rect = egui::Rect::from_min_size(
-                                egui::pos2(current_x, comment.y + emoji_y_offset),
+                                egui::pos2(current_x, comment.y + (current_line as f32 * line_height) + emoji_y_offset),
                                 egui::vec2(emoji_width, emoji_height)
                             );
                             painter.image(
@@ -1035,37 +1027,49 @@ impl eframe::App for MisskeyViewerApp {
                         }
                     }
                 } else {
-                    // テキストを描画
-                    // 影
-                    painter.text(
-                        egui::pos2(current_x, comment.y) + egui::vec2(2.0, 2.0),
-                        egui::Align2::LEFT_TOP,
-                        &content,
-                        font_id.clone(),
-                        egui::Color32::BLACK,
-                    );
-                    // 本体
-                    let galley = painter.layout_no_wrap(
-                        content.clone(),
-                        font_id.clone(),
-                        egui::Color32::WHITE
-                    );
-                    painter.text(
-                        egui::pos2(current_x, comment.y),
-                        egui::Align2::LEFT_TOP,
-                        &content,
-                        font_id.clone(),
-                        egui::Color32::WHITE,
-                    );
-                    current_x += galley.rect.width();
+                    // テキストを改行ごとに分割して描画
+                    for (line_idx, line) in content.split('\n').enumerate() {
+                        if line_idx > 0 {
+                            // 改行があった場合
+                            current_line += 1;
+                            current_x = comment.x; // X座標をリセット
+                        }
+                        
+                        if !line.is_empty() {
+                            let current_y = comment.y + (current_line as f32 * line_height);
+                            
+                            // 影
+                            painter.text(
+                                egui::pos2(current_x, current_y) + egui::vec2(2.0, 2.0),
+                                egui::Align2::LEFT_TOP,
+                                line,
+                                font_id.clone(),
+                                egui::Color32::BLACK,
+                            );
+                            // 本体
+                            let galley = painter.layout_no_wrap(
+                                line.to_string(),
+                                font_id.clone(),
+                                egui::Color32::WHITE
+                            );
+                            painter.text(
+                                egui::pos2(current_x, current_y),
+                                egui::Align2::LEFT_TOP,
+                                line,
+                                font_id.clone(),
+                                egui::Color32::WHITE,
+                            );
+                            current_x += galley.rect.width();
+                        }
+                    }
                 }
             }
             
             // URLプレビューを表示
             if let Some(preview) = &comment.url_preview {
-                // プレビューカードをテキストの直後に表示
-                let card_y = comment.y; // テキストと同じ高さ
-                let card_x = current_x + 15.0; // テキストの右側に少し離して表示
+                // プレビューカードをすべての行の下に表示
+                let card_y = comment.y + ((current_line + 1) as f32 * line_height); // 最終行の下に表示
+                let card_x = comment.x; // テキストの開始位置と同じX座標
                 let thumbnail_size = 80.0; // サムネイルのサイズ
                 
                 // 画像URLの有無でレイアウトを変更
