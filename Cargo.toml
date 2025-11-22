@@ -49,8 +49,14 @@ features = ["blocking", "json"]
 
 [dependencies.image]
 version = "0.25"
-features = ["gif"]
+features = ["gif", "png"]
 
 [dependencies.egui_extras]
 version = "0.33.2"
 features = ["image"]
+
+[dependencies.scraper]
+version = "0.22"
+
+[dependencies.regex]
+version = "1.11"

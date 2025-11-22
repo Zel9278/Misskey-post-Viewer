@@ -1,13 +1,9 @@
-#![windows_subsystem = "windows"]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui;
-use misskey_post_viewer::MisskeyClient;
+use misskey_post_viewer::{MisskeyClient, AppConfig, Account, TimelineType, EmojiInfo, EmojiCache};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-
-
-use serde::{Deserialize, Serialize};
-use std::collections::{VecDeque, HashMap};
-use std::path::PathBuf;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 use crossbeam_channel::{unbounded, Receiver as CrossbeamReceiver};
@@ -18,187 +14,121 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GWL_EXSTYLE, WS_EX_LAYERED, WS_EX_TRANSPARENT, WM_USER,
 };
 use tray_icon::{TrayIconBuilder, menu::{Menu, MenuItem}};
-use egui::{ColorImage, TextureHandle};
-
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
-enum TimelineType {
-    #[serde(rename = "hybrid")]
-    Hybrid,
-    #[serde(rename = "local")]
-    Local,
-    #[serde(rename = "home")]
-    Home,
-    #[serde(rename = "global")]
-    Global,
-}
-
-impl Default for TimelineType {
-    fn default() -> Self {
-        TimelineType::Hybrid
-    }
-}
-
-impl TimelineType {
-    fn to_channel_name(&self) -> &str {
-        match self {
-            TimelineType::Hybrid => "hybridTimeline",
-            TimelineType::Local => "localTimeline",
-            TimelineType::Home => "homeTimeline",
-            TimelineType::Global => "globalTimeline",
-        }
-    }
-    
-    fn display_name(&self) -> &str {
-        match self {
-            TimelineType::Hybrid => "ハイブリッド",
-            TimelineType::Local => "ローカル",
-            TimelineType::Home => "ホーム",
-            TimelineType::Global => "グローバル",
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-struct Account {
-    name: String,
-    host: String,
-    token: Option<String>,
-    #[serde(default)]
-    timeline: TimelineType,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-struct AppConfig {
-    #[serde(default)]
-    accounts: Vec<Account>,
-    #[serde(default)]
-    active_account_index: usize,
-    #[serde(default)]
-    debug: bool,
-    #[serde(default)]
-    fallback_font: Option<String>,
-    // 互換性のために古い形式もサポート
-    #[serde(skip_serializing)]
-    host: Option<String>,
-    #[serde(skip_serializing)]
-    token: Option<String>,
-}
-
-impl AppConfig {
-    fn new() -> Result<Self, config::ConfigError> {
-        let mut builder = config::Config::builder();
-
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(exe_dir) = exe_path.parent() {
-                let exe_config_path = exe_dir.join("config.toml");
-                if exe_config_path.exists() {
-                    builder = builder.add_source(config::File::from(exe_config_path));
-                }
-            }
-        }
-
-        let current_dir_config = PathBuf::from("config.toml");
-        if current_dir_config.exists() {
-            builder = builder.add_source(config::File::from(current_dir_config));
-        }
-
-        builder = builder.add_source(config::Environment::with_prefix("MISSKEY"));
-
-        let settings = builder.build()?;
-        let mut config: AppConfig = settings.try_deserialize()?;
-        
-        // 古い形式からの移行：hostとtokenがあればアカウントリストに追加
-        if let Some(host) = config.host.take() {
-            if config.accounts.is_empty() {
-                config.accounts.push(Account {
-                    name: format!("Account - {}", host),
-                    host,
-                    token: config.token.take(),
-                    timeline: TimelineType::default(),
-                });
-            }
-        }
-        
-        // アカウントがなければデフォルトを追加
-        if config.accounts.is_empty() {
-            config.accounts.push(Account {
-                name: "Default Account".to_string(),
-                host: "misskey.io".to_string(),
-                token: None,
-                timeline: TimelineType::default(),
-            });
-        }
-        
-        Ok(config)
-    }
-    
-    fn get_active_account(&self) -> Option<&Account> {
-        self.accounts.get(self.active_account_index)
-    }
-    
-    fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
-        use std::io::Write;
-        
-        let mut content = String::new();
-        content.push_str("# Misskey Post Viewer Configuration\n\n");
-        content.push_str(&format!("active_account_index = {}\n", self.active_account_index));
-        content.push_str(&format!("debug = {}\n", self.debug));
-        if let Some(font) = &self.fallback_font {
-            content.push_str(&format!("fallback_font = \"{}\"\n", font));
-        }
-        content.push_str("\n");
-        content.push_str("[[accounts]]\n");
-        
-        for account in &self.accounts {
-            content.push_str(&format!("name = \"{}\"\n", account.name));
-            content.push_str(&format!("host = \"{}\"\n", account.host));
-            if let Some(token) = &account.token {
-                content.push_str(&format!("token = \"{}\"\n", token));
-            }
-            // タイムライン設定を保存
-            let timeline_str = match account.timeline {
-                TimelineType::Hybrid => "hybrid",
-                TimelineType::Local => "local",
-                TimelineType::Home => "home",
-                TimelineType::Global => "global",
-            };
-            content.push_str(&format!("timeline = \"{}\"\n", timeline_str));
-            content.push_str("\n[[accounts]]\n");
-        }
-        
-        // 最後の[[accounts]]を削除
-        if content.ends_with("\n[[accounts]]\n") {
-            content.truncate(content.len() - 14);
-        }
-        
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(exe_dir) = exe_path.parent() {
-                let config_path = exe_dir.join("config.toml");
-                let mut file = std::fs::File::create(config_path)?;
-                file.write_all(content.as_bytes())?;
-                return Ok(());
-            }
-        }
-        
-        let current_dir_config = PathBuf::from("config.toml");
-        let mut file = std::fs::File::create(current_dir_config)?;
-        file.write_all(content.as_bytes())?;
-        Ok(())
-    }
-}
 
 #[derive(Clone)]
-struct EmojiInfo {
-    name: String,
+struct UrlPreview {
     url: String,
+    title: String,
+    description: Option<String>,
+    image_url: Option<String>,
+    site_name: Option<String>,
+    favicon_url: Option<String>,
 }
 
-struct AnimatedEmoji {
-    frames: Vec<ColorImage>,
-    frame_durations: Vec<u32>, // ミリ秒
-    textures: Vec<TextureHandle>,
-    current_frame: usize,
-    elapsed_ms: u32,
+struct PreviewImageCache {
+    cache: std::collections::HashMap<String, Option<egui::TextureHandle>>,
+    downloading: std::collections::HashMap<String, bool>,
+    rx: std::sync::mpsc::Receiver<(String, egui::ColorImage)>,
+    tx: std::sync::mpsc::Sender<(String, egui::ColorImage)>,
+}
+
+impl PreviewImageCache {
+    fn new() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<(String, egui::ColorImage)>();
+        Self {
+            cache: std::collections::HashMap::new(),
+            downloading: std::collections::HashMap::new(),
+            rx,
+            tx,
+        }
+    }
+
+    fn load_image(&mut self, url: &str, debug_mode: bool) -> Option<egui::TextureHandle> {
+        // キャッシュをチェック
+        if let Some(cached) = self.cache.get(url) {
+            return cached.clone();
+        }
+        
+        // ダウンロード中かチェック
+        if self.downloading.contains_key(url) {
+            return None;
+        }
+        
+        // ダウンロード開始
+        self.downloading.insert(url.to_string(), true);
+        let url_clone = url.to_string();
+        let tx = self.tx.clone();
+        
+        std::thread::spawn(move || {
+            use std::time::Duration;
+            
+            let client = reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build();
+            
+            match client {
+                Ok(client) => {
+                    match client.get(&url_clone).send() {
+                        Ok(response) => {
+                            if response.status().is_success() {
+                                match response.bytes() {
+                                    Ok(bytes) => {
+                                        // 画像デコードもこのスレッドで実行
+                                        match image::load_from_memory(&bytes) {
+                                            Ok(img) => {
+                                                let size = [img.width() as usize, img.height() as usize];
+                                                let rgba = img.to_rgba8();
+                                                let pixels = rgba.as_flat_samples();
+                                                let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                                                    size, 
+                                                    pixels.as_slice()
+                                                );
+                                                let _ = tx.send((url_clone.clone(), color_image));
+                                            }
+                                            Err(e) => {
+                                                if debug_mode { 
+                                                    eprintln!("Failed to decode preview image {}: {}", url_clone, e); 
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        if debug_mode { eprintln!("Failed to read preview image bytes: {}", e); }
+                                    }
+                                }
+                            } else {
+                                if debug_mode { eprintln!("Failed to download preview image (HTTP {})", response.status()); }
+                            }
+                        }
+                        Err(e) => {
+                            if debug_mode { eprintln!("Failed to download preview image: {}", e); }
+                        }
+                    }
+                }
+                Err(e) => {
+                    if debug_mode { eprintln!("Failed to create HTTP client: {}", e); }
+                }
+            }
+        });
+        
+        None
+    }
+
+    fn process_downloads(&mut self, ctx: &egui::Context, _debug_mode: bool) {
+        while let Ok((url, color_image)) = self.rx.try_recv() {
+            self.downloading.remove(&url);
+            
+            // デコード済みの画像をテクスチャに変換（軽い処理）
+            let texture = ctx.load_texture(
+                &url,
+                color_image,
+                egui::TextureOptions::LINEAR
+            );
+            
+            self.cache.insert(url, Some(texture));
+            ctx.request_repaint();
+        }
+    }
 }
 
 struct Comment {
@@ -211,6 +141,7 @@ struct Comment {
     user_host: Option<String>,
     renote_info: Option<(String, String, String, String)>, // (元投稿者のname, 元投稿者のusername, 元投稿者のhost, 元投稿テキスト)
     emojis: Vec<EmojiInfo>, // カスタム絵文字情報
+    url_preview: Option<UrlPreview>, // URLプレビュー情報
 }
 
 enum TrayEvent {
@@ -234,15 +165,10 @@ struct MisskeyViewerApp {
     edit_account_host: String,
     edit_account_token: String,
     selected_account_index: Option<usize>,
-    // 絵文字キャッシュ（静止画）
-    emoji_cache: HashMap<String, Option<TextureHandle>>,
-    // アニメーション絵文字キャッシュ
-    animated_emoji_cache: HashMap<String, AnimatedEmoji>,
-    // 絵文字ダウンロード中フラグ
-    emoji_downloading: HashMap<String, bool>,
-    // 絵文字ダウンロード結果チャネル
-    emoji_rx: std::sync::mpsc::Receiver<(String, Vec<u8>)>,
-    emoji_tx: std::sync::mpsc::Sender<(String, Vec<u8>)>,
+    // 絵文字キャッシュ
+    emoji_cache: EmojiCache,
+    // プレビュー画像キャッシュ
+    preview_image_cache: PreviewImageCache,
 }
 
 impl MisskeyViewerApp {
@@ -287,7 +213,6 @@ impl MisskeyViewerApp {
         
         let (tx, rx) = std::sync::mpsc::channel();
         let (reconnect_tx, mut reconnect_rx) = tokio::sync::mpsc::unbounded_channel::<AppConfig>();
-        let (emoji_tx, emoji_rx) = std::sync::mpsc::channel::<(String, Vec<u8>)>();
         let is_connected = Arc::new(Mutex::new(false));
         let is_connected_clone = is_connected.clone();
         let runtime = Runtime::new().expect("Failed to create Tokio runtime");
@@ -408,9 +333,9 @@ impl MisskeyViewerApp {
                                                             for emoji_name in emoji_names {
                                                                 // 既に取得済みかチェック
                                                                 if !emojis.iter().any(|e| e.name == emoji_name) {
-                                                                    // APIから取得を試みる
-                                                                    if let Ok(response) = reqwest::blocking::get(format!("https://{}/api/emoji?name={}", host, emoji_name)) {
-                                                                        if let Ok(emoji_data) = response.json::<serde_json::Value>() {
+                                                                    // APIから取得を試みる（非同期）
+                                                                    if let Ok(response) = reqwest::get(format!("https://{}/api/emoji?name={}", host, emoji_name)).await {
+                                                                        if let Ok(emoji_data) = response.json::<serde_json::Value>().await {
                                                                             if let Some(url) = emoji_data.get("url").and_then(|v| v.as_str()) {
                                                                                 if debug_mode { println!("DEBUG: Fetched emoji from API {} -> {}", emoji_name, url); }
                                                                                 emojis.push(EmojiInfo {
@@ -437,6 +362,49 @@ impl MisskeyViewerApp {
                                                                             if let Some(url) = emoji_url.as_str() {
                                                                                 if !emojis.iter().any(|e| e.name == *emoji_name) {
                                                                                     if debug_mode { println!("DEBUG: Renote Emoji {} -> {}", emoji_name, url); }
+                                                                                    emojis.push(EmojiInfo {
+                                                                                        name: emoji_name.clone(),
+                                                                                        url: url.to_string(),
+                                                                                    });
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                                
+                                                                // リノート元のテキストから絵文字を抽出
+                                                                let mut renote_text_for_emoji = String::new();
+                                                                if let Some(text) = renote.get("text").and_then(|v| v.as_str()) {
+                                                                    renote_text_for_emoji.push_str(text);
+                                                                }
+                                                                if let Some(cw) = renote.get("cw").and_then(|v| v.as_str()) {
+                                                                    renote_text_for_emoji.push(' ');
+                                                                    renote_text_for_emoji.push_str(cw);
+                                                                }
+                                                                // リノート元の投稿者名も追加
+                                                                renote_text_for_emoji.push(' ');
+                                                                renote_text_for_emoji.push_str(&orig_name);
+                                                                
+                                                                let renote_emoji_names: Vec<String> = renote_text_for_emoji
+                                                                    .split(':')
+                                                                    .enumerate()
+                                                                    .filter_map(|(i, part)| {
+                                                                        if i % 2 == 1 && !part.is_empty() {
+                                                                            Some(part.to_string())
+                                                                        } else {
+                                                                            None
+                                                                        }
+                                                                    })
+                                                                    .collect();
+                                                                
+                                                                for emoji_name in renote_emoji_names {
+                                                                    // 既に取得済みかチェック
+                                                                    if !emojis.iter().any(|e| e.name == emoji_name) {
+                                                                        // APIから取得を試みる
+                                                                        if let Ok(response) = reqwest::get(format!("https://{}/api/emoji?name={}", host, emoji_name)).await {
+                                                                            if let Ok(emoji_data) = response.json::<serde_json::Value>().await {
+                                                                                if let Some(url) = emoji_data.get("url").and_then(|v| v.as_str()) {
+                                                                                    if debug_mode { println!("DEBUG: Fetched renote emoji from API {} -> {}", emoji_name, url); }
                                                                                     emojis.push(EmojiInfo {
                                                                                         name: emoji_name.clone(),
                                                                                         url: url.to_string(),
@@ -494,6 +462,17 @@ impl MisskeyViewerApp {
                                                             if debug_mode { println!("New Note from @{}: {}", username, truncated_text); }
 
                                                             if !text_content.is_empty() || renote_info.is_some() {
+                                                                // URL検出してOGPメタデータを取得（非同期）
+                                                                let url_preview = if let Some(url) = detect_url(&text_content) {
+                                                                    if debug_mode {
+                                                                        println!("DEBUG: Detected URL: {}", url);
+                                                                    }
+                                                                    // OGPメタデータを非同期で取得
+                                                                    fetch_ogp_metadata(&url, debug_mode).await
+                                                                } else {
+                                                                    None
+                                                                };
+                                                                
                                                                 // ランダムなY座標と速度を生成
                                                                 use rand::Rng;
                                                                 let mut rng = rand::rng();
@@ -510,6 +489,7 @@ impl MisskeyViewerApp {
                                                                     user_host,
                                                                     renote_info,
                                                                     emojis,
+                                                                    url_preview,
                                                                 };
                                                                 let _ = tx.send(comment);
                                                             }
@@ -579,108 +559,8 @@ impl MisskeyViewerApp {
             edit_account_host,
             edit_account_token,
             selected_account_index: None,
-            emoji_cache: HashMap::new(),
-            animated_emoji_cache: HashMap::new(),
-            emoji_downloading: HashMap::new(),
-            emoji_rx,
-            emoji_tx,
-        }
-    }
-    
-    fn load_emoji(&mut self, _ctx: &egui::Context, url: &str) -> Option<TextureHandle> {
-        // アニメーションキャッシュをチェック
-        if self.animated_emoji_cache.contains_key(url) {
-            if let Some(anim) = self.animated_emoji_cache.get(url) {
-                return Some(anim.textures[anim.current_frame].clone());
-            }
-        }
-        
-        // 静止画キャッシュをチェック
-        if let Some(cached) = self.emoji_cache.get(url) {
-            return cached.clone();
-        }
-        
-        // ダウンロード中かチェック
-        if self.emoji_downloading.contains_key(url) {
-            return None; // ダウンロード中は表示しない
-        }
-        
-        // ダウンロード開始
-        self.emoji_downloading.insert(url.to_string(), true);
-        let url_clone = url.to_string();
-        let emoji_tx = self.emoji_tx.clone();
-        
-        // 別スレッドでダウンロード
-        std::thread::spawn(move || {
-            if let Ok(response) = reqwest::blocking::get(&url_clone) {
-                if let Ok(bytes) = response.bytes() {
-                    let _ = emoji_tx.send((url_clone.clone(), bytes.to_vec()));
-                }
-            }
-        });
-        
-        None
-    }
-    
-    fn load_gif_frames(&mut self, ctx: &egui::Context, url: &str, bytes: &[u8]) -> Result<Vec<TextureHandle>, Box<dyn std::error::Error>> {
-        use image::AnimationDecoder;
-        use image::codecs::gif::GifDecoder;
-        use std::io::Cursor;
-        
-        let cursor = Cursor::new(bytes);
-        let decoder = GifDecoder::new(cursor)?;
-        let frames = decoder.into_frames().collect_frames()?;
-        
-        let mut color_images = Vec::new();
-        let mut durations = Vec::new();
-        let mut textures = Vec::new();
-        
-        for (i, frame) in frames.iter().enumerate() {
-            let img = frame.buffer();
-            let size = [img.width() as usize, img.height() as usize];
-            let pixels = img.as_flat_samples();
-            let color_image = ColorImage::from_rgba_unmultiplied(size, pixels.as_slice());
-            
-            let texture = ctx.load_texture(
-                format!("{}_frame_{}", url, i),
-                color_image.clone(),
-                egui::TextureOptions::LINEAR
-            );
-            
-            color_images.push(color_image);
-            textures.push(texture);
-            
-            let (numer, denom) = frame.delay().numer_denom_ms();
-            durations.push(numer / denom.max(1));
-        }
-        
-        if !textures.is_empty() {
-            self.animated_emoji_cache.insert(url.to_string(), AnimatedEmoji {
-                frames: color_images,
-                frame_durations: durations,
-                textures: textures.clone(),
-                current_frame: 0,
-                elapsed_ms: 0,
-            });
-        }
-        
-        Ok(textures)
-    }
-    
-    fn update_animations(&mut self, dt: f32) {
-        let dt_ms = (dt * 1000.0) as u32;
-        
-        for anim in self.animated_emoji_cache.values_mut() {
-            anim.elapsed_ms += dt_ms;
-            
-            if anim.current_frame < anim.frame_durations.len() {
-                let current_duration = anim.frame_durations[anim.current_frame];
-                
-                if anim.elapsed_ms >= current_duration {
-                    anim.elapsed_ms = 0;
-                    anim.current_frame = (anim.current_frame + 1) % anim.textures.len();
-                }
-            }
+            emoji_cache: EmojiCache::new(),
+            preview_image_cache: PreviewImageCache::new(),
         }
     }
 
@@ -743,7 +623,8 @@ impl eframe::App for MisskeyViewerApp {
         let dt = ctx.input(|i| i.stable_dt);
         
         // アニメーション絵文字を更新
-        self.update_animations(dt);
+        let dt_ms = (dt * 1000.0) as u32;
+        self.emoji_cache.update_animations(dt_ms);
         
         // フラグをチェックしてイベント処理をトリガー
         if let Ok(mut flag) = self.tray_event_flag.try_lock() {
@@ -974,37 +855,10 @@ impl eframe::App for MisskeyViewerApp {
         }
 
         // ダウンロード完了した絵文字を処理
-        while let Ok((url, bytes)) = self.emoji_rx.try_recv() {
-            self.emoji_downloading.remove(&url);
-            
-            // GIFかどうかチェック
-            if url.ends_with(".gif") {
-                if let Ok(_frames) = self.load_gif_frames(ctx, &url, &bytes) {
-                    // 既にload_gif_framesでキャッシュに追加されている
-                    ctx.request_repaint(); // 再描画をリクエスト
-                    continue;
-                }
-            }
-            
-            // 通常の画像として読み込み
-            if let Ok(img) = image::load_from_memory(&bytes) {
-                let size = [img.width() as usize, img.height() as usize];
-                let rgba = img.to_rgba8();
-                let pixels = rgba.as_flat_samples();
-                let color_image = ColorImage::from_rgba_unmultiplied(size, pixels.as_slice());
-                
-                let texture = ctx.load_texture(
-                    &url,
-                    color_image,
-                    egui::TextureOptions::LINEAR
-                );
-                
-                self.emoji_cache.insert(url, Some(texture));
-                ctx.request_repaint(); // 再描画をリクエスト
-            } else {
-                self.emoji_cache.insert(url, None);
-            }
-        }
+        self.emoji_cache.process_downloads(ctx, debug_mode);
+        
+        // ダウンロード完了したプレビュー画像を処理
+        self.preview_image_cache.process_downloads(ctx, debug_mode);
         
         // 新しいコメントを受信
         while let Ok(mut comment) = self.rx.try_recv() {
@@ -1054,7 +908,7 @@ impl eframe::App for MisskeyViewerApp {
             .flat_map(|c| c.emojis.iter().map(|e| e.url.clone()))
             .collect();
         for url in emoji_urls {
-            self.load_emoji(ctx, &url);
+            self.emoji_cache.load_emoji(ctx, &url, debug_mode);
         }
         
         // レイヤーペインターを使って直接描画
@@ -1151,11 +1005,11 @@ impl eframe::App for MisskeyViewerApp {
                     // 絵文字を画像として描画
                     if let Some(emoji_info) = emoji_info {
                         // アニメーション絵文字をチェック
-                        let texture = if let Some(anim) = self.animated_emoji_cache.get(&emoji_info.url) {
+                        let texture = if let Some(anim) = self.emoji_cache.animated_cache.get(&emoji_info.url) {
                             Some(&anim.textures[anim.current_frame])
                         } else {
                             // 静止画絵文字をチェック
-                            self.emoji_cache.get(&emoji_info.url).and_then(|opt| opt.as_ref())
+                            self.emoji_cache.static_cache.get(&emoji_info.url).and_then(|opt| opt.as_ref())
                         };
                         
                         if let Some(texture) = texture {
@@ -1205,6 +1059,257 @@ impl eframe::App for MisskeyViewerApp {
                     );
                     current_x += galley.rect.width();
                 }
+            }
+            
+            // URLプレビューを表示
+            if let Some(preview) = &comment.url_preview {
+                // プレビューカードをテキストの直後に表示
+                let card_y = comment.y; // テキストと同じ高さ
+                let card_x = current_x + 15.0; // テキストの右側に少し離して表示
+                let thumbnail_size = 80.0; // サムネイルのサイズ
+                
+                // 画像URLの有無でレイアウトを変更
+                let has_image = preview.image_url.is_some();
+                let card_width = if has_image { 350.0 } else { 280.0 };
+                let left_offset = if has_image { thumbnail_size + 8.0 } else { 8.0 };
+                let text_max_width = card_width - left_offset - 8.0;
+                
+                // 内容に応じてカードの高さを計算
+                let mut content_height: f32 = 10.0; // 上下の余白
+                let has_description = preview.description.is_some();
+                
+                // タイトル: 16px
+                content_height += 16.0;
+                // 説明: 13px (ある場合のみ)
+                if has_description {
+                    content_height += 13.0;
+                }
+                // URL: 13px
+                content_height += 13.0;
+                // サイト名/Favicon: 16px (常に表示)
+                content_height += 16.0;
+                
+                // 画像がある場合は最低80pxを確保
+                let card_height = if has_image {
+                    content_height.max(thumbnail_size)
+                } else {
+                    content_height
+                };
+                
+                // カード背景
+                let card_rect = egui::Rect::from_min_size(
+                    egui::pos2(card_x, card_y),
+                    egui::vec2(card_width, card_height)
+                );
+                painter.rect_filled(
+                    card_rect,
+                    egui::Rounding::same(4),
+                    egui::Color32::from_rgba_premultiplied(30, 30, 30, 240)
+                );
+                
+                // サムネイル画像（左側）- 画像URLがある場合のみ
+                if let Some(image_url) = &preview.image_url {
+                    let thumbnail_rect = egui::Rect::from_min_size(
+                        egui::pos2(card_x, card_y),
+                        egui::vec2(thumbnail_size, card_height)
+                    );
+                    
+                    // 画像をロードして表示
+                    if let Some(texture) = self.preview_image_cache.load_image(image_url, self.config.debug) {
+                        // アスペクト比を維持してサムネイルに収める
+                        let img_size = texture.size_vec2();
+                        let aspect = img_size.x / img_size.y;
+                        let (draw_width, draw_height) = if aspect > (thumbnail_size / card_height) {
+                            // 横長画像
+                            (thumbnail_size, thumbnail_size / aspect)
+                        } else {
+                            // 縦長画像
+                            (card_height * aspect, card_height)
+                        };
+                        
+                        let offset_x = (thumbnail_size - draw_width) / 2.0;
+                        let offset_y = (card_height - draw_height) / 2.0;
+                        
+                        let draw_rect = egui::Rect::from_min_size(
+                            egui::pos2(card_x + offset_x, card_y + offset_y),
+                            egui::vec2(draw_width, draw_height)
+                        );
+                        
+                        painter.image(
+                            texture.id(),
+                            draw_rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE
+                        );
+                    } else {
+                        // 画像読み込み中は背景色を表示
+                        painter.rect_filled(
+                            thumbnail_rect,
+                            egui::Rounding::same(4),
+                            egui::Color32::from_rgb(60, 60, 60)
+                        );
+                    }
+                }
+                
+                // タイトルと説明を表示
+                let title_font = egui::FontId::proportional(12.0);
+                let desc_font = egui::FontId::proportional(9.0);
+                let url_font = egui::FontId::proportional(9.0);
+                
+                let text_x = card_x + left_offset; // 画像の有無で位置を調整
+                let mut text_y = card_y + 5.0;
+                
+                // タイトル（幅で切り詰め）
+                let title_galley = painter.layout_no_wrap(
+                    preview.title.clone(),
+                    title_font.clone(),
+                    egui::Color32::WHITE
+                );
+                let title_text = if title_galley.rect.width() > text_max_width {
+                    let mut truncated = preview.title.clone();
+                    while !truncated.is_empty() {
+                        let test_galley = painter.layout_no_wrap(
+                            format!("{}...", truncated),
+                            title_font.clone(),
+                            egui::Color32::WHITE
+                        );
+                        if test_galley.rect.width() <= text_max_width {
+                            break;
+                        }
+                        truncated.pop();
+                    }
+                    format!("{}...", truncated)
+                } else {
+                    preview.title.clone()
+                };
+                
+                painter.text(
+                    egui::pos2(text_x, text_y),
+                    egui::Align2::LEFT_TOP,
+                    title_text,
+                    title_font,
+                    egui::Color32::WHITE
+                );
+                text_y += 16.0;
+                
+                // 説明（幅で切り詰め）
+                if let Some(description) = &preview.description {
+                    let desc_galley = painter.layout_no_wrap(
+                        description.clone(),
+                        desc_font.clone(),
+                        egui::Color32::from_rgb(180, 180, 180)
+                    );
+                    let desc_text = if desc_galley.rect.width() > text_max_width {
+                        let mut truncated = description.clone();
+                        while !truncated.is_empty() {
+                            let test_galley = painter.layout_no_wrap(
+                                format!("{}...", truncated),
+                                desc_font.clone(),
+                                egui::Color32::from_rgb(180, 180, 180)
+                            );
+                            if test_galley.rect.width() <= text_max_width {
+                                break;
+                            }
+                            truncated.pop();
+                        }
+                        format!("{}...", truncated)
+                    } else {
+                        description.clone()
+                    };
+                    
+                    painter.text(
+                        egui::pos2(text_x, text_y),
+                        egui::Align2::LEFT_TOP,
+                        desc_text,
+                        desc_font.clone(),
+                        egui::Color32::from_rgb(180, 180, 180)
+                    );
+                    text_y += 13.0;
+                }
+                
+                // URL（幅で切り詰め）
+                let url_galley = painter.layout_no_wrap(
+                    preview.url.clone(),
+                    url_font.clone(),
+                    egui::Color32::from_rgb(120, 140, 180)
+                );
+                let url_text = if url_galley.rect.width() > text_max_width {
+                    let mut truncated = preview.url.clone();
+                    while !truncated.is_empty() {
+                        let test_galley = painter.layout_no_wrap(
+                            format!("{}...", truncated),
+                            url_font.clone(),
+                            egui::Color32::from_rgb(120, 140, 180)
+                        );
+                        if test_galley.rect.width() <= text_max_width {
+                            break;
+                        }
+                        truncated.pop();
+                    }
+                    format!("{}...", truncated)
+                } else {
+                    preview.url.clone()
+                };
+                
+                painter.text(
+                    egui::pos2(text_x, text_y),
+                    egui::Align2::LEFT_TOP,
+                    url_text,
+                    url_font,
+                    egui::Color32::from_rgb(120, 140, 180)
+                );
+                text_y += 13.0;
+                
+                // サイト名とFavicon（下部）
+                let site_font = egui::FontId::proportional(9.0);
+                let favicon_size = 12.0;
+                
+                // Faviconがあるかチェック
+                let mut has_favicon = false;
+                if let Some(favicon_url) = &preview.favicon_url {
+                    if let Some(favicon_texture) = self.preview_image_cache.load_image(favicon_url, self.config.debug) {
+                        let favicon_rect = egui::Rect::from_min_size(
+                            egui::pos2(text_x, text_y),
+                            egui::vec2(favicon_size, favicon_size)
+                        );
+                        painter.image(
+                            favicon_texture.id(),
+                            favicon_rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE
+                        );
+                        has_favicon = true;
+                    }
+                }
+                
+                // サイト名の表示位置（Faviconがあれば右側、なければ左端）
+                let site_text_x = if has_favicon {
+                    text_x + favicon_size + 4.0
+                } else {
+                    text_x
+                };
+                
+                // サイト名を表示
+                let site_display_name = if let Some(site_name) = &preview.site_name {
+                    site_name.clone()
+                } else {
+                    // サイト名がない場合はURLのホスト部分を表示
+                    if let Ok(parsed_url) = reqwest::Url::parse(&preview.url) {
+                        parsed_url.host_str().unwrap_or(&preview.url).to_string()
+                    } else {
+                        preview.url.clone()
+                    }
+                };
+                
+                painter.text(
+                    egui::pos2(site_text_x, text_y),
+                    egui::Align2::LEFT_TOP,
+                    site_display_name,
+                    site_font,
+                    egui::Color32::from_rgb(150, 150, 150)
+                );
+                
+                current_x = card_x + card_width; // プレビューカードの右端まで幅を拡張
             }
             
             // テキストの幅を推定して、完全に画面外に出てから削除
@@ -1261,6 +1366,147 @@ fn trigger_window_update() {
     }
 }
 
+// URLを検出する（軽量な処理）
+fn detect_url(text: &str) -> Option<String> {
+    use regex::Regex;
+    let url_regex = Regex::new(r"https?://[^\s]+").ok()?;
+    url_regex.find(text).map(|m| m.as_str().to_string())
+}
+
+// OGPメタデータを非同期で取得
+async fn fetch_ogp_metadata(url: &str, debug_mode: bool) -> Option<UrlPreview> {
+    use scraper::{Html, Selector};
+    use std::time::Duration;
+    
+    if debug_mode {
+        println!("DEBUG: Fetching OGP metadata for: {}", url);
+    }
+    
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .build()
+        .ok()?;
+    
+    let response = client.get(url).send().await.ok()?;
+    
+    if debug_mode {
+        println!("DEBUG: HTTP status: {}", response.status());
+    }
+    
+    let html_content = response.text().await.ok()?;
+    let document = Html::parse_document(&html_content);
+    
+    // OGPタグとフォールバック用のセレクター
+    let og_title_selector = Selector::parse(r#"meta[property="og:title"]"#).ok()?;
+    let og_description_selector = Selector::parse(r#"meta[property="og:description"]"#).ok()?;
+    let og_image_selector = Selector::parse(r#"meta[property="og:image"]"#).ok()?;
+    let og_site_name_selector = Selector::parse(r#"meta[property="og:site_name"]"#).ok()?;
+    let title_selector = Selector::parse("title").ok()?;
+    let description_selector = Selector::parse(r#"meta[name="description"]"#).ok()?;
+    let favicon_selector = Selector::parse(r#"link[rel="icon"], link[rel="shortcut icon"]"#).ok()?;
+    
+    // タイトル取得
+    let title = document
+        .select(&og_title_selector)
+        .next()
+        .and_then(|el| el.value().attr("content"))
+        .map(|s| s.to_string())
+        .or_else(|| {
+            document
+                .select(&title_selector)
+                .next()
+                .map(|el| el.text().collect::<String>())
+        });
+    
+    // 説明取得
+    let description = document
+        .select(&og_description_selector)
+        .next()
+        .and_then(|el| el.value().attr("content"))
+        .map(|s| s.to_string())
+        .or_else(|| {
+            document
+                .select(&description_selector)
+                .next()
+                .and_then(|el| el.value().attr("content"))
+                .map(|s| s.to_string())
+        });
+    
+    // 画像URL取得
+    let image_url = document
+        .select(&og_image_selector)
+        .next()
+        .and_then(|el| el.value().attr("content"))
+        .map(|s| s.to_string());
+    
+    // サイト名取得
+    let site_name = document
+        .select(&og_site_name_selector)
+        .next()
+        .and_then(|el| el.value().attr("content"))
+        .map(|s| s.to_string());
+    
+    // Favicon URL取得
+    let favicon_url = document
+        .select(&favicon_selector)
+        .next()
+        .and_then(|el| el.value().attr("href"))
+        .map(|href| {
+            // 相対URLを絶対URLに変換
+            if href.starts_with("http://") || href.starts_with("https://") {
+                href.to_string()
+            } else if href.starts_with("//") {
+                format!("https:{}", href)
+            } else if href.starts_with('/') {
+                // URLのホスト部分を抽出
+                if let Ok(parsed_url) = reqwest::Url::parse(url) {
+                    format!("{}://{}{}", parsed_url.scheme(), parsed_url.host_str().unwrap_or(""), href)
+                } else {
+                    href.to_string()
+                }
+            } else {
+                // 相対パス
+                if let Ok(parsed_url) = reqwest::Url::parse(url) {
+                    format!("{}://{}/{}", parsed_url.scheme(), parsed_url.host_str().unwrap_or(""), href)
+                } else {
+                    href.to_string()
+                }
+            }
+        })
+        .or_else(|| {
+            // Faviconが見つからない場合はデフォルトの/favicon.icoを試す
+            if let Ok(parsed_url) = reqwest::Url::parse(url) {
+                Some(format!("{}://{}/favicon.ico", parsed_url.scheme(), parsed_url.host_str().unwrap_or("")))
+            } else {
+                None
+            }
+        });
+    
+    // サイト名がない場合はホスト名を使用
+    let site_name = site_name.or_else(|| {
+        if let Ok(parsed_url) = reqwest::Url::parse(url) {
+            parsed_url.host_str().map(|h| h.to_string())
+        } else {
+            None
+        }
+    });
+    
+    if debug_mode {
+        println!("DEBUG: OGP - title: {:?}, description: {:?}, image: {:?}, site_name: {:?}, favicon: {:?}", 
+                 title, description, image_url, site_name, favicon_url);
+    }
+    
+    Some(UrlPreview {
+        url: url.to_string(),
+        title: title.unwrap_or_else(|| url.to_string()),
+        description,
+        image_url,
+        site_name,
+        favicon_url,
+    })
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // トレイアイコンのメニュー作成
     let tray_menu = Menu::new();
@@ -1311,29 +1557,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     
-    // トレイアイコン作成（シンプルなアイコン画像を生成）
-    let icon_rgba = {
-        let size = 32;
-        let mut rgba = vec![0u8; size * size * 4];
-        for y in 0..size {
-            for x in 0..size {
-                let idx = (y * size + x) * 4;
-                // 青い円を描画
-                let dx = x as i32 - size as i32 / 2;
-                let dy = y as i32 - size as i32 / 2;
-                let dist = ((dx * dx + dy * dy) as f32).sqrt();
-                if dist < size as f32 / 2.0 {
-                    rgba[idx] = 50;      // R
-                    rgba[idx + 1] = 150; // G
-                    rgba[idx + 2] = 255; // B
-                    rgba[idx + 3] = 255; // A
-                }
-            }
-        }
-        rgba
+    // トレイアイコン作成（icon.icoファイルから読み込み）
+    let icon = {
+        let icon_bytes = include_bytes!("../icon.ico");
+        let icon_image = image::load_from_memory(icon_bytes)?;
+        let icon_rgba = icon_image.to_rgba8();
+        let (width, height) = icon_rgba.dimensions();
+        tray_icon::Icon::from_rgba(icon_rgba.into_raw(), width, height)?
     };
-    
-    let icon = tray_icon::Icon::from_rgba(icon_rgba, 32, 32)?;
     
     let _tray_icon = TrayIconBuilder::new()
         .with_menu(Box::new(tray_menu))
@@ -1362,12 +1593,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 active_account_index: 0,
                 debug: false,
                 fallback_font: None,
-                host: None,
-                token: None,
             }
         }
     };
 
+    // ウィンドウアイコン用の画像を読み込み
+    let window_icon = {
+        let icon_bytes = include_bytes!("../icon.ico");
+        let icon_image = image::load_from_memory(icon_bytes).ok();
+        icon_image.map(|img| {
+            let rgba = img.to_rgba8();
+            let (width, height) = rgba.dimensions();
+            egui::IconData {
+                rgba: rgba.into_raw(),
+                width: width,
+                height: height,
+            }
+        })
+    };
+    
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_decorations(false) // 枠なし
@@ -1377,7 +1621,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_position([0.0, 0.0])
             .with_mouse_passthrough(false)
             .with_visible(true) // 明示的に可視化
-            .with_active(true), // アクティブ状態を維持
+            .with_active(true) // アクティブ状態を維持
+            .with_icon(window_icon.unwrap_or_else(|| {
+                // フォールバック: デフォルトアイコン
+                egui::IconData {
+                    rgba: vec![0; 32 * 32 * 4],
+                    width: 32,
+                    height: 32,
+                }
+            })),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
