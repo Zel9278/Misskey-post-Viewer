@@ -142,6 +142,8 @@ struct Comment {
     renote_info: Option<(String, String, String, String)>, // (元投稿者のname, 元投稿者のusername, 元投稿者のhost, 元投稿テキスト)
     emojis: Vec<EmojiInfo>, // カスタム絵文字情報
     url_preview: Option<UrlPreview>, // URLプレビュー情報
+    account_color: [u8; 3], // このコメントが属するアカウントの文字色
+    account_name: String, // このコメントが属するアカウント名
 }
 
 enum TrayEvent {
@@ -157,18 +159,427 @@ struct MisskeyViewerApp {
     reconnect_tx: tokio::sync::mpsc::UnboundedSender<AppConfig>,
     _runtime: Runtime,
     window_configured: bool,
-    show_settings: bool,
     config: AppConfig,
     is_connected: Arc<Mutex<bool>>,
+    // 絵文字キャッシュ
+    emoji_cache: EmojiCache,
+    // プレビュー画像キャッシュ
+    preview_image_cache: PreviewImageCache,
+    // 設定ファイル監視用
+    config_last_modified: Option<std::time::SystemTime>,
+}
+
+struct SettingsWindow {
+    config: AppConfig,
+    reconnect_tx: tokio::sync::mpsc::UnboundedSender<AppConfig>,
     // アカウント編集用
     edit_account_name: String,
     edit_account_host: String,
     edit_account_token: String,
     selected_account_index: Option<usize>,
-    // 絵文字キャッシュ
-    emoji_cache: EmojiCache,
-    // プレビュー画像キャッシュ
-    preview_image_cache: PreviewImageCache,
+    // MiAuth認証用
+    pending_miauth: Option<(usize, String, misskey_post_viewer::MiAuthSession)>, // (account_index, host, session)
+    // サーバー候補
+    available_instances: Vec<misskey_post_viewer::InstanceInfo>,
+    instances_loaded: bool,
+}
+
+impl SettingsWindow {
+    fn new(config: AppConfig, reconnect_tx: tokio::sync::mpsc::UnboundedSender<AppConfig>) -> Self {
+        Self {
+            config,
+            reconnect_tx,
+            edit_account_name: String::new(),
+            edit_account_host: String::new(),
+            edit_account_token: String::new(),
+            selected_account_index: None,
+            pending_miauth: None,
+            available_instances: Vec::new(),
+            instances_loaded: false,
+        }
+    }
+}
+
+// 設定ウィンドウ専用のApp（独立したウィンドウ用）
+struct SettingsWindowApp {
+    settings: SettingsWindow,
+}
+
+impl SettingsWindowApp {
+    fn new(config: AppConfig, reconnect_tx: tokio::sync::mpsc::UnboundedSender<AppConfig>) -> Self {
+        Self {
+            settings: SettingsWindow::new(config, reconnect_tx),
+        }
+    }
+}
+
+impl eframe::App for SettingsWindowApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if !self.settings.show(ui, ctx) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        });
+    }
+}
+
+impl SettingsWindow {
+    pub fn show(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> bool {
+        let mut keep_open = true;
+            ui.heading("Misskey Post Viewer 設定");
+            ui.separator();
+            
+            ui.label("アカウント一覧:");
+            ui.add_space(5.0);
+            
+            // アカウント一覧表示（リスト型、チェックボックス付き）
+            egui::ScrollArea::vertical()
+                .max_height(250.0)
+                .show(ui, |ui| {
+                    let mut changed = false;
+                    let mut to_select = None;
+                    for (idx, account) in self.config.accounts.iter_mut().enumerate() {
+                        let is_selected = self.selected_account_index == Some(idx);
+                        
+                        ui.group(|ui| {
+                            ui.horizontal(|ui| {
+                                // 有効/無効チェックボックス
+                                if ui.checkbox(&mut account.enabled, "").changed() {
+                                    changed = true;
+                                }
+                                
+                                // アカウント名とホスト (選択可能)
+                                let label_text = format!("{} ({})", account.name, account.host);
+                                if ui.selectable_label(is_selected, &label_text).clicked() {
+                                    to_select = Some(idx);
+                                }
+                                
+                                // 文字色プレビュー
+                                let color = egui::Color32::from_rgb(
+                                    account.text_color[0],
+                                    account.text_color[1],
+                                    account.text_color[2]
+                                );
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(20.0, 20.0),
+                                    egui::Sense::hover()
+                                );
+                                ui.painter().rect_filled(rect, 0.0, color);
+                            });
+                            
+                            // 選択中のアカウントの詳細設定
+                            if is_selected {
+                                ui.separator();
+                                
+                                // タイムライン選択
+                                ui.horizontal(|ui| {
+                                    ui.label("タイムライン:");
+                                    egui::ComboBox::from_id_salt(format!("timeline_{}", idx))
+                                        .selected_text(account.timeline.display_name())
+                                        .show_ui(ui, |ui| {
+                                            if ui.selectable_value(&mut account.timeline, TimelineType::Hybrid, TimelineType::Hybrid.display_name()).clicked() {
+                                                changed = true;
+                                            }
+                                            if ui.selectable_value(&mut account.timeline, TimelineType::Local, TimelineType::Local.display_name()).clicked() {
+                                                changed = true;
+                                            }
+                                            if ui.selectable_value(&mut account.timeline, TimelineType::Home, TimelineType::Home.display_name()).clicked() {
+                                                changed = true;
+                                            }
+                                            if ui.selectable_value(&mut account.timeline, TimelineType::Global, TimelineType::Global.display_name()).clicked() {
+                                                changed = true;
+                                            }
+                                        });
+                                });
+                                
+                                // 文字色選択
+                                ui.horizontal(|ui| {
+                                    ui.label("文字色:");
+                                    let mut color = egui::Color32::from_rgb(
+                                        account.text_color[0],
+                                        account.text_color[1],
+                                        account.text_color[2]
+                                    );
+                                    if ui.color_edit_button_srgba(&mut color).changed() {
+                                        account.text_color = [color.r(), color.g(), color.b()];
+                                        changed = true;
+                                    }
+                                });
+                                
+                                // トークン表示（隠す）
+                                if account.token.is_some() {
+                                    ui.label("トークン: ********（設定済み）");
+                                } else {
+                                    ui.label("トークン: 未設定");
+                                }
+                            }
+                        });
+                        ui.add_space(3.0);
+                    }
+                    
+                    if let Some(idx) = to_select {
+                        self.selected_account_index = Some(idx);
+                    }
+                    
+                    // 変更があったら保存
+                    if changed {
+                        if let Err(e) = self.config.save() {
+                            eprintln!("設定の保存に失敗: {}", e);
+                        }
+                    }
+                });
+            
+            // MiAuth認証チェック処理
+            let miauth_data = self.pending_miauth.clone();
+            if let Some((account_idx, host, session)) = miauth_data {
+                ui.separator();
+                ui.label("🔐 MiAuth認証待機中...");
+                ui.label("ブラウザで認証を完了してください");
+                ui.label("(認証が完了すると自動的にアカウントが追加されます)");
+                
+                let check_auth = true; // 自動チェックを有効化
+                let mut cancel_auth = false;
+                
+                ui.horizontal(|ui| {
+                    if ui.button("✗ キャンセル").clicked() {
+                        cancel_auth = true;
+                    }
+                });
+                
+                // 自動的に認証状態を確認
+                if check_auth {
+                    // UIを再描画して次回もチェック
+                    ctx.request_repaint();
+                    // 非同期処理をblockする
+                    let rt = Runtime::new().expect("Failed to create runtime");
+                    let result = rt.block_on(session.check());
+                    match result {
+                        Ok((token, username)) => {
+                            println!("認証成功! トークン: {}...", &token[..8.min(token.len())]);
+                            if let Some(ref user) = username {
+                                println!("ユーザー名: {}", user);
+                            }
+                            
+                            println!("DEBUG: account_idx={}, accounts.len()={}", account_idx, self.config.accounts.len());
+                            
+                            // 新規アカウント追加の場合
+                            if account_idx >= self.config.accounts.len() {
+                                // アカウント名を決定
+                                let account_name = if !self.edit_account_name.is_empty() {
+                                    // 手動入力されたアカウント名を使用
+                                    self.edit_account_name.clone()
+                                } else if let Some(user) = username {
+                                    // MiAuthから取得したユーザー名を使用: "ユーザー名 (サーバー)"
+                                    format!("{} ({})", user, host)
+                                } else {
+                                    // ユーザー名が取得できない場合はホスト名のみ
+                                    host.clone()
+                                };
+                                
+                                let new_account = Account::new(
+                                    account_name,
+                                    host.clone(),
+                                    Some(token),
+                                    TimelineType::default(),
+                                    true,
+                                    [255, 255, 255],
+                                );
+                                self.config.accounts.push(new_account);
+                                println!("アカウント追加完了。現在のアカウント数: {}", self.config.accounts.len());
+                                self.edit_account_name.clear();
+                                self.edit_account_host.clear();
+                                self.edit_account_token.clear();
+                            } else {
+                                // 既存アカウントの場合
+                                self.config.accounts[account_idx].token = Some(token);
+                                println!("既存アカウント[{}]にトークンを設定", account_idx);
+                            }
+                            
+                            println!("設定を保存します...");
+                            if let Err(e) = self.config.save() {
+                                eprintln!("設定の保存に失敗: {}", e);
+                            } else {
+                                println!("設定の保存成功！");
+                                // 再接続シグナルを送信
+                                if let Err(e) = self.reconnect_tx.send(self.config.clone()) {
+                                    eprintln!("再接続シグナルの送信に失敗: {}", e);
+                                }
+                            }
+                            self.pending_miauth = None;
+                        }
+                        Err(e) => {
+                            eprintln!("認証確認失敗: {}", e);
+                        }
+                    }
+                }
+                
+                if cancel_auth {
+                    self.pending_miauth = None;
+                }
+            }
+            
+            // アカウント操作ボタン
+            ui.horizontal(|ui| {
+                if ui.button("🗑 選択したアカウントを削除").clicked() {
+                    if let Some(idx) = self.selected_account_index {
+                        if idx < self.config.accounts.len() && self.config.accounts.len() > 1 {
+                            self.config.accounts.remove(idx);
+                            if self.config.active_account_index >= self.config.accounts.len() {
+                                self.config.active_account_index = 0;
+                            }
+                            self.selected_account_index = None;
+                            let _ = self.config.save();
+                        }
+                    }
+                }
+                
+                if ui.button("🔄 設定を再適用 (再接続)").clicked() {
+                    if let Err(e) = self.config.save() {
+                        eprintln!("設定の保存に失敗: {}", e);
+                    } else {
+                        // 再接続シグナルを送信
+                        if let Err(e) = self.reconnect_tx.send(self.config.clone()) {
+                            eprintln!("再接続シグナルの送信に失敗: {}", e);
+                        }
+                    }
+                }
+            });
+            
+            ui.add_space(10.0);
+            ui.separator();
+            
+            // 新規アカウント追加
+            ui.label("新規アカウント追加:");
+            ui.add_space(5.0);
+            
+            ui.label("アカウント名:");
+            ui.text_edit_singleline(&mut self.edit_account_name);
+            
+            ui.add_space(5.0);
+            
+            ui.label("サーバー (例: misskey.io):");
+            ui.text_edit_singleline(&mut self.edit_account_host);
+            
+            // サーバー候補を表示
+            if !self.instances_loaded {
+                if ui.button("📋 人気のサーバーを表示").clicked() {
+                    let ctx = ui.ctx().clone();
+                    let instances_loaded = &mut self.instances_loaded;
+                    let available_instances = &mut self.available_instances;
+                    
+                    // 非同期でサーバー一覧を取得
+                    let rt = Runtime::new().expect("Failed to create runtime");
+                    match rt.block_on(misskey_post_viewer::fetch_instances()) {
+                        Ok(instances) => {
+                            *available_instances = instances;
+                            *instances_loaded = true;
+                            ctx.request_repaint();
+                        }
+                        Err(e) => {
+                            eprintln!("サーバー一覧の取得に失敗: {}", e);
+                        }
+                    }
+                }
+            } else {
+                ui.label("人気のサーバー (クリックで入力):");
+                egui::ScrollArea::vertical()
+                    .id_salt("instance_list_scroll")
+                    .max_height(200.0)
+                    .show(ui, |ui| {
+                        for (idx, instance) in self.available_instances.clone().iter().enumerate() {
+                            let host = instance.url.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/');
+                            let label = if let Some(name) = &instance.name {
+                                if let (Some(npd15), Some(dru15)) = (instance.npd15, instance.dru15) {
+                                    format!("{} ({}) - ノート/日: {:.0}, アクティブユーザー: {:.0}", 
+                                        name, 
+                                        host,
+                                        npd15,
+                                        dru15
+                                    )
+                                } else {
+                                    format!("{} ({})", name, host)
+                                }
+                            } else {
+                                host.to_string()
+                            };
+                            
+                            if ui.button(format!("{}##instance_{}", &label, idx)).clicked() {
+                                self.edit_account_host = host.to_string();
+                            }
+                        }
+                    });
+                
+                if ui.button("✗ リストを閉じる").clicked() {
+                    self.instances_loaded = false;
+                }
+            }
+            
+            ui.add_space(5.0);
+            
+            ui.label("アクセストークン (オプション):");
+            ui.add(egui::TextEdit::singleline(&mut self.edit_account_token).password(true));
+            
+            ui.add_space(5.0);
+            
+            // MiAuthログインボタン
+            ui.horizontal(|ui| {
+                let can_miauth = !self.edit_account_host.is_empty();
+                if ui.add_enabled(can_miauth, egui::Button::new("MiAuthでログイン")).clicked() {
+                    // 一時的なアカウントインデックスとして使用
+                    let temp_index = self.config.accounts.len();
+                    let session = misskey_post_viewer::MiAuthSession::new(
+                        &self.edit_account_host,
+                        "Misskey Post Viewer",
+                        Some("ニコニコ風コメント表示アプリ"),
+                        &["read:account", "read:messaging"]
+                    );
+                    println!("MiAuth URL: {}", session.url);
+                    let _ = open::that(&session.url);
+                    self.pending_miauth = Some((temp_index, self.edit_account_host.clone(), session));
+                }
+                if !can_miauth {
+                    ui.label("(サーバーを入力してください)");
+                }
+            });
+            
+            ui.add_space(10.0);
+            
+            if ui.button("アカウントを追加").clicked() {
+                if !self.edit_account_name.is_empty() && !self.edit_account_host.is_empty() {
+                    let new_account = Account::new(
+                        self.edit_account_name.clone(),
+                        self.edit_account_host.clone(),
+                        if self.edit_account_token.is_empty() { None } else { Some(self.edit_account_token.clone()) },
+                        TimelineType::default(),
+                        true,
+                        [255, 255, 255],
+                    );
+                    self.config.accounts.push(new_account);
+                    self.edit_account_name.clear();
+                    self.edit_account_host.clear();
+                    self.edit_account_token.clear();
+                }
+            }
+            
+            ui.add_space(10.0);
+            ui.separator();
+            
+            ui.horizontal(|ui| {
+                if ui.button("保存").clicked() {
+                    if let Err(e) = self.config.save() {
+                        eprintln!("設定の保存に失敗: {}", e);
+                    }
+                }
+                
+                if ui.button("閉じる").clicked() {
+                    keep_open = false;
+                }
+            });
+            
+            ui.add_space(10.0);
+        
+        keep_open
+    }
 }
 
 impl MisskeyViewerApp {
@@ -217,63 +628,82 @@ impl MisskeyViewerApp {
         let is_connected_clone = is_connected.clone();
         let runtime = Runtime::new().expect("Failed to create Tokio runtime");
 
-        // Misskeyクライアントを別スレッドで実行
+        // 複数Misskeyクライアントを並列実行
         let mut current_config = config.clone();
         let debug_mode = current_config.debug;
-        let mut is_manual_reconnect = false;
-        let mut consecutive_failures = 0u32; // 連続失敗カウンタ
+        
+        // 各アカウント用のタスクハンドルを保持
+        let mut account_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        
         runtime.spawn(async move {
+            // 初回起動
+            let mut should_start = true;
+            
             loop {
                 // 再接続リクエストをチェック
                 if let Ok(new_config) = reconnect_rx.try_recv() {
-                    let reconnect_start = std::time::Instant::now();
-                    println!("[MANUAL] Config update received at {:?}, reconnecting immediately...", reconnect_start.elapsed());
+                    println!("[MANUAL] Config update received, reconnecting all accounts...");
                     *is_connected_clone.lock().unwrap() = false;
                     current_config = new_config;
-                    is_manual_reconnect = true;
-                    consecutive_failures = 0;
+                    
+                    // 既存のタスクをすべてキャンセル（自動的に切断）
+                    for handle in account_handles.drain(..) {
+                        handle.abort();
+                    }
+                    should_start = true;
                 }
                 
-                let account = current_config.get_active_account().cloned();
-                if let Some(account) = account {
-                    let start_time = std::time::Instant::now();
-                    println!("[{:?}] Connecting to Misskey ({}) ...", start_time.elapsed(), account.host);
-                    match MisskeyClient::connect(&account.host, account.token.clone()).await {
-                        Ok(mut client) => {
-                            println!("[SUCCESS] WebSocket connected in {:?}!", start_time.elapsed());
-                            *is_connected_clone.lock().unwrap() = true;
-                            consecutive_failures = 0;
-                            is_manual_reconnect = false;
-                        
-                        // アカウントのタイムライン設定を使用
-                        let channel = account.timeline.to_channel_name();
-                        let id = format!("{}-1", channel);
-
-                        if let Err(e) = client.subscribe(channel, &id, serde_json::json!({})) {
-                            eprintln!("[ERROR] Subscribe failed: {}", e);
-                            consecutive_failures += 1;
-                            continue;
-                        }
-                        println!("Subscribed to {} ({}).", channel, account.timeline.display_name());
-
+                // タスクが起動していない場合のみ起動
+                if should_start {
+                    should_start = false;
+                    
+                    // enabled=trueの全アカウントに接続
+                    let enabled_accounts: Vec<_> = current_config.accounts.iter()
+                        .filter(|a| a.enabled)
+                        .cloned()
+                        .collect();
+                    
+                    if enabled_accounts.is_empty() {
+                        println!("[WARN] No enabled accounts found");
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    
+                    println!("[INFO] Starting {} account connections...", enabled_accounts.len());
+                    
+                    // 各アカウントごとに並列接続タスクを起動
+                    for account in enabled_accounts {
+                    let tx_clone = tx.clone();
+                    let account_clone = account.clone();
+                    let debug_clone = debug_mode;
+                    
+                    let handle = tokio::spawn(async move {
+                        let mut consecutive_failures = 0u32;
                         loop {
-                            tokio::select! {
-                                // 再接続リクエストを即座に受信
-                                Some(new_config) = reconnect_rx.recv() => {
-                                    let close_start = std::time::Instant::now();
-                                    println!("[MANUAL] Reconnection requested, closing current connection...");
-                                    client.close();
-                                    println!("[MANUAL] Connection closed in {:?}", close_start.elapsed());
-                                    *is_connected_clone.lock().unwrap() = false;
-                                    current_config = new_config;
-                                    is_manual_reconnect = true;
+                            let start_time = std::time::Instant::now();
+                            println!("[{}] Connecting to Misskey ({}) ...", account_clone.name, account_clone.host);
+                            match MisskeyClient::connect(&account_clone.host, account_clone.token.clone()).await {
+                                Ok(mut client) => {
+                                    println!("[{}] WebSocket connected in {:?}!", account_clone.name, start_time.elapsed());
                                     consecutive_failures = 0;
-                                    break;
-                                }
-                                // WebSocketメッセージを受信
-                                msg_result = client.next_message() => {
-                            if let Some(msg_result) = msg_result {
-                            match msg_result {
+                                
+                                    // アカウントのタイムライン設定を使用
+                                    let channel = account_clone.timeline.to_channel_name();
+                                    let id = format!("{}-{}", channel, account_clone.name);
+
+                                    if let Err(e) = client.subscribe(channel, &id, serde_json::json!({})) {
+                                        eprintln!("[{}] Subscribe failed: {}", account_clone.name, e);
+                                        consecutive_failures += 1;
+                                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                                        continue;
+                                    }
+                                    println!("[{}] Subscribed to {} ({}).", account_clone.name, channel, account_clone.timeline.display_name());
+
+                                    loop {
+                                        // WebSocketメッセージを受信
+                                        let msg_result = client.next_message().await;
+                                        if let Some(msg_result) = msg_result {
+                                            match msg_result {
                                 Ok(msg) => {
                                     // println!("Received: {:?}", msg); // デバッグ用: 全メッセージ表示
                                     if let Message::Text(text) = msg {
@@ -282,7 +712,6 @@ impl MisskeyViewerApp {
                                                 if let Some(type_) = body.get("type") {
                                                     if type_ == "note" {
                                                         if let Some(note_body) = body.get("body") {
-                                                            if debug_mode { println!("DEBUG: note_body keys: {:?}", note_body.as_object().map(|o| o.keys().collect::<Vec<_>>())); }
                                                             let user = note_body.get("user");
                                                             let name = user.and_then(|u| u.get("name")).and_then(|v| v.as_str()).unwrap_or("Unknown").to_string();
                                                             let username = user.and_then(|u| u.get("username")).and_then(|v| v.as_str()).unwrap_or("Unknown").to_string();
@@ -290,14 +719,12 @@ impl MisskeyViewerApp {
                                                             
                                                             // 絵文字情報を抽出
                                                             let mut emojis = Vec::new();
-                                                            let host = &account.host;
+                                                            let host = &account_clone.host;
                                                             
                                                             if let Some(emojis_obj) = note_body.get("emojis") {
-                                                                if debug_mode { println!("DEBUG: Found emojis field: {:?}", emojis_obj); }
                                                                 if let Some(emoji_map) = emojis_obj.as_object() {
                                                                     for (emoji_name, emoji_url) in emoji_map {
                                                                         if let Some(url) = emoji_url.as_str() {
-                                                                            if debug_mode { println!("DEBUG: Emoji {} -> {}", emoji_name, url); }
                                                                             emojis.push(EmojiInfo {
                                                                                 name: emoji_name.clone(),
                                                                                 url: url.to_string(),
@@ -305,8 +732,6 @@ impl MisskeyViewerApp {
                                                                         }
                                                                     }
                                                                 }
-                                                            } else {
-                                                                if debug_mode { println!("DEBUG: No emojis field in note_body"); }
                                                             }
                                                             
                                                             // テキストと名前から絵文字タグを探して、まだURLが取得できていないものをAPIで取得
@@ -333,7 +758,6 @@ impl MisskeyViewerApp {
                                                                     if let Ok(response) = reqwest::get(format!("https://{}/api/emoji?name={}", host, emoji_name)).await {
                                                                         if let Ok(emoji_data) = response.json::<serde_json::Value>().await {
                                                                             if let Some(url) = emoji_data.get("url").and_then(|v| v.as_str()) {
-                                                                                if debug_mode { println!("DEBUG: Fetched emoji from API {} -> {}", emoji_name, url); }
                                                                                 emojis.push(EmojiInfo {
                                                                                     name: emoji_name.clone(),
                                                                                     url: url.to_string(),
@@ -357,7 +781,6 @@ impl MisskeyViewerApp {
                                                                         for (emoji_name, emoji_url) in emoji_map {
                                                                             if let Some(url) = emoji_url.as_str() {
                                                                                 if !emojis.iter().any(|e| e.name == *emoji_name) {
-                                                                                    if debug_mode { println!("DEBUG: Renote Emoji {} -> {}", emoji_name, url); }
                                                                                     emojis.push(EmojiInfo {
                                                                                         name: emoji_name.clone(),
                                                                                         url: url.to_string(),
@@ -394,7 +817,6 @@ impl MisskeyViewerApp {
                                                                         if let Ok(response) = reqwest::get(format!("https://{}/api/emoji?name={}", host, emoji_name)).await {
                                                                             if let Ok(emoji_data) = response.json::<serde_json::Value>().await {
                                                                                 if let Some(url) = emoji_data.get("url").and_then(|v| v.as_str()) {
-                                                                                    if debug_mode { println!("DEBUG: Fetched renote emoji from API {} -> {}", emoji_name, url); }
                                                                                     emojis.push(EmojiInfo {
                                                                                         name: emoji_name.clone(),
                                                                                         url: url.to_string(),
@@ -448,17 +870,12 @@ impl MisskeyViewerApp {
                                                             } else {
                                                                 text_content.clone()
                                                             };
-                                                            
-                                                            if debug_mode { println!("New Note from @{}: {}", username, truncated_text); }
 
                                                             if !text_content.is_empty() || renote_info.is_some() {
                                                                 // URL検出してOGPメタデータを取得（非同期）
                                                                 let url_preview = if let Some(url) = detect_url(&text_content) {
-                                                                    if debug_mode {
-                                                                        println!("DEBUG: Detected URL: {}", url);
-                                                                    }
                                                                     // OGPメタデータを非同期で取得
-                                                                    fetch_ogp_metadata(&url, debug_mode).await
+                                                                    fetch_ogp_metadata(&url, debug_clone).await
                                                                 } else {
                                                                     None
                                                                 };
@@ -480,8 +897,10 @@ impl MisskeyViewerApp {
                                                                     renote_info,
                                                                     emojis,
                                                                     url_preview,
+                                                                    account_color: account_clone.text_color,
+                                                                    account_name: account_clone.name.clone(),
                                                                 };
-                                                                let _ = tx.send(comment);
+                                                                let _ = tx_clone.send(comment);
                                                             }
                                                         }
                                                     }
@@ -489,51 +908,52 @@ impl MisskeyViewerApp {
                                             }
                                         }
                                     }
+                                                }
+                                                Err(e) => {
+                                                    eprintln!("[{}] WebSocket error: {}", account_clone.name, e);
+                                                    break;
+                                                }
+                                            }
+                                        } else {
+                                            break;
+                                        }
+                                    }
                                 }
                                 Err(e) => {
-                                    eprintln!("WebSocket error: {}", e);
-                                    break;
-                                }
-                            }
-                            } else {
-                                break;
-                            }
+                                    eprintln!("[{}] Connection failed: {}", account_clone.name, e);
+                                    consecutive_failures += 1;
+                                    
+                                    // 指数バックオフ
+                                    let wait_secs = std::cmp::min(2u64.pow(consecutive_failures.saturating_sub(1)), 5);
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(wait_secs)).await;
                                 }
                             }
                         }
+                    });
+                    
+                    account_handles.push(handle);
                     }
-                    Err(e) => {
-                        eprintln!("[ERROR] Connection failed (attempt #{}): {}", consecutive_failures + 1, e);
-                        consecutive_failures += 1;
-                        
-                        // 手動再接続で失敗が3回以上連続したら通常モードに切り替え
-                        if is_manual_reconnect && consecutive_failures >= 3 {
-                            eprintln!("[WARN] Manual reconnect failed 3 times, switching to normal retry mode");
-                            is_manual_reconnect = false;
-                        }
-                    }
-                    }
+                    
+                    // すべてのアカウントが接続されるまで待機
+                    *is_connected_clone.lock().unwrap() = !account_handles.is_empty();
                 }
                 
-                // 再接続前に待機
-                if is_manual_reconnect && consecutive_failures < 3 {
-                    // 手動再接続で失敗が3回未満なら即座にリトライ
-                    println!("[MANUAL] Retrying immediately... (failure #{})", consecutive_failures);
-                } else if consecutive_failures > 0 {
-                    // 指数バックオフ: 1秒 → 2秒 → 4秒 (最大5秒)
-                    let wait_secs = std::cmp::min(2u64.pow(consecutive_failures.saturating_sub(1)), 5);
-                    println!("[BACKOFF] Waiting {} seconds before retry (failure #{})", wait_secs, consecutive_failures);
-                    tokio::time::sleep(tokio::time::Duration::from_secs(wait_secs)).await;
-                }
-                // consecutive_failures == 0 の場合は即座に再接続
+                // 次の再接続チェックまで待機
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             }
         });
 
-        let active_account = config.get_active_account().cloned();
-        let edit_account_name = active_account.as_ref().map(|a| a.name.clone()).unwrap_or_default();
-        let edit_account_host = active_account.as_ref().map(|a| a.host.clone()).unwrap_or_default();
-        let edit_account_token = active_account.as_ref().and_then(|a| a.token.clone()).unwrap_or_default();
-        
+        // 設定ファイルの初期タイムスタンプを取得
+        let config_path = if let Ok(exe_path) = std::env::current_exe() {
+            exe_path.parent().map(|p| p.join("config.toml"))
+        } else {
+            Some(std::path::PathBuf::from("config.toml"))
+        };
+        let config_last_modified = config_path
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .and_then(|m| m.modified().ok());
+
         Self {
             comments: VecDeque::new(),
             rx,
@@ -542,15 +962,11 @@ impl MisskeyViewerApp {
             reconnect_tx,
             _runtime: runtime,
             window_configured: false,
-            show_settings: false,
             config: config.clone(),
             is_connected,
-            edit_account_name,
-            edit_account_host,
-            edit_account_token,
-            selected_account_index: None,
             emoji_cache: EmojiCache::new(),
             preview_image_cache: PreviewImageCache::new(),
+            config_last_modified,
         }
     }
 
@@ -579,30 +995,6 @@ impl MisskeyViewerApp {
         }
     }
     
-    fn disable_window_clickthrough(&mut self, frame: &eframe::Frame) {
-        if let Ok(handle) = frame.window_handle() {
-             if let RawWindowHandle::Win32(handle) = handle.as_raw() {
-                let hwnd = HWND(handle.hwnd.get() as _);
-                unsafe {
-                    // クリックスルーを無効化（WS_EX_TRANSPARENTを削除）
-                    let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-                    let new_style = (ex_style | (WS_EX_LAYERED.0 as isize)) & !(WS_EX_TRANSPARENT.0 as isize);
-                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style);
-                }
-            }
-        }
-    }
-    
-    fn bring_to_foreground(&self, frame: &eframe::Frame) {
-        if let Ok(handle) = frame.window_handle() {
-             if let RawWindowHandle::Win32(handle) = handle.as_raw() {
-                let hwnd = HWND(handle.hwnd.get() as _);
-                unsafe {
-                    let _ = SetForegroundWindow(hwnd);
-                }
-            }
-        }
-    }
 }
 
 impl eframe::App for MisskeyViewerApp {
@@ -625,16 +1017,43 @@ impl eframe::App for MisskeyViewerApp {
             }
         }
         
+        // 設定ファイルの変更をチェック
+        let config_path = if let Ok(exe_path) = std::env::current_exe() {
+            exe_path.parent().map(|p| p.join("config.toml"))
+        } else {
+            Some(std::path::PathBuf::from("config.toml"))
+        };
+        
+        if let Some(path) = config_path {
+            if let Ok(metadata) = std::fs::metadata(&path) {
+                if let Ok(modified) = metadata.modified() {
+                    if self.config_last_modified.is_none() || 
+                       self.config_last_modified.as_ref().map(|last| modified > *last).unwrap_or(false) {
+                        // 設定ファイルが更新された
+                        println!("[CONFIG] Configuration file changed, reloading...");
+                        if let Ok(new_config) = AppConfig::new() {
+                            self.config = new_config.clone();
+                            self.config_last_modified = Some(modified);
+                            // 再接続シグナルを送信
+                            let _ = self.reconnect_tx.send(new_config);
+                            println!("[CONFIG] Configuration reloaded and reconnection triggered");
+                        }
+                    }
+                }
+            }
+        }
+        
         // トレイアイコンのメニューイベントを処理
         while let Ok(event) = self.tray_rx.try_recv() {
             match event {
                 TrayEvent::Settings => {
-                    println!("Opening settings... (before: {})", self.show_settings);
-                    self.show_settings = true;
-                    println!("Opening settings... (after: {})", self.show_settings);
-                    // 設定ウィンドウを開くときのみフォアグラウンドに
-                    self.bring_to_foreground(frame);
-                    ctx.request_repaint();
+                    println!("Opening settings window in separate process...");
+                    // 別プロセスで設定ウィンドウを起動
+                    if let Ok(exe_path) = std::env::current_exe() {
+                        let _ = std::process::Command::new(exe_path)
+                            .arg("--settings")
+                            .spawn();
+                    }
                 }
                 TrayEvent::Quit => {
                     println!("Quitting...");
@@ -643,206 +1062,17 @@ impl eframe::App for MisskeyViewerApp {
             }
         }
         
-        // Ctrl+Sで設定画面をトグル
-        ctx.input(|i| {
-            if i.modifiers.ctrl && i.key_pressed(egui::Key::S) {
-                self.show_settings = !self.show_settings;
-            }
+        // クリックスルーを有効化
+        // eguiの入力処理を完全に無効化
+        ctx.input_mut(|i| {
+            i.events.clear();
+            i.pointer = Default::default();
+            i.raw.hovered_files.clear();
+            i.raw.dropped_files.clear();
         });
 
-        // 設定画面を表示
-        if self.show_settings {
-            // 設定画面表示中はクリックスルーを無効化
-            self.disable_window_clickthrough(frame);
-            
-            egui::Window::new("設定")
-                .collapsible(false)
-                .resizable(true)
-                .default_width(500.0)
-                .show(ctx, |ui| {
-                    ui.heading("Misskey Post Viewer 設定");
-                    ui.separator();
-                    
-                    ui.label("アカウント一覧:");
-                    ui.add_space(5.0);
-                    
-                    // アカウント一覧表示
-                    egui::ScrollArea::vertical()
-                        .max_height(150.0)
-                        .show(ui, |ui| {
-                            for (idx, account) in self.config.accounts.iter().enumerate() {
-                                let is_active = idx == self.config.active_account_index;
-                                let label_text = if is_active {
-                                    format!("★ {} ({})", account.name, account.host)
-                                } else {
-                                    format!("  {} ({})", account.name, account.host)
-                                };
-                                
-                                ui.horizontal(|ui| {
-                                    if ui.selectable_label(self.selected_account_index == Some(idx), &label_text).clicked() {
-                                        self.selected_account_index = Some(idx);
-                                    }
-                                });
-                            }
-                        });
-                    
-                    ui.add_space(10.0);
-                    ui.separator();
-                    
-                    // タイムライン設定（グローバル）
-                    ui.label("タイムライン設定:");
-                    ui.add_space(5.0);
-                    
-                    if !self.config.accounts.is_empty() {
-                        let active_idx = self.config.active_account_index;
-                        if active_idx < self.config.accounts.len() {
-                            let account = &mut self.config.accounts[active_idx];
-                            ui.horizontal(|ui| {
-                                ui.label("現在のアカウント:");
-                                ui.label(format!("{} ({})", account.name, account.host));
-                            });
-                            ui.add_space(5.0);
-                            egui::ComboBox::from_id_salt("timeline_selector")
-                                .selected_text(account.timeline.display_name())
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut account.timeline, TimelineType::Hybrid, TimelineType::Hybrid.display_name());
-                                    ui.selectable_value(&mut account.timeline, TimelineType::Local, TimelineType::Local.display_name());
-                                    ui.selectable_value(&mut account.timeline, TimelineType::Home, TimelineType::Home.display_name());
-                                    ui.selectable_value(&mut account.timeline, TimelineType::Global, TimelineType::Global.display_name());
-                                });
-                            
-                            ui.add_space(5.0);
-                            if ui.button("タイムライン変更を適用").clicked() {
-                                // config.tomlに保存
-                                if let Err(e) = self.config.save() {
-                                    eprintln!("設定の保存に失敗: {}", e);
-                                } else {
-                                    // 再接続シグナルを送信
-                                    println!("Sending reconnect signal for timeline change...");
-                                    if let Err(e) = self.reconnect_tx.send(self.config.clone()) {
-                                        eprintln!("再接続シグナルの送信に失敗: {}", e);
-                                    } else {
-                                        // コメントをクリア
-                                        self.comments.clear();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    
-                    ui.add_space(10.0);
-                    ui.separator();
-                    
-                    // 選択中のアカウント操作
-                    ui.horizontal(|ui| {
-                        if ui.button("切り替え").clicked() {
-                            if let Some(idx) = self.selected_account_index {
-                                if idx < self.config.accounts.len() {
-                                    self.config.active_account_index = idx;
-                                    // config.tomlに保存
-                                    if let Err(e) = self.config.save() {
-                                        eprintln!("設定の保存に失敗: {}", e);
-                                    } else {
-                                        // 再接続シグナルを送信（再起動不要）
-                                        println!("Sending reconnect signal...");
-                                        if let Err(e) = self.reconnect_tx.send(self.config.clone()) {
-                                            eprintln!("再接続シグナルの送信に失敗: {}", e);
-                                        } else {
-                                            // コメントをクリア
-                                            self.comments.clear();
-                                            self.show_settings = false;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        
-                        if ui.button("削除").clicked() {
-                            if let Some(idx) = self.selected_account_index {
-                                if idx < self.config.accounts.len() && self.config.accounts.len() > 1 {
-                                    self.config.accounts.remove(idx);
-                                    if self.config.active_account_index >= self.config.accounts.len() {
-                                        self.config.active_account_index = 0;
-                                    }
-                                    self.selected_account_index = None;
-                                }
-                            }
-                        }
-                    });
-                    
-                    ui.add_space(10.0);
-                    ui.separator();
-                    
-                    // 新規アカウント追加
-                    ui.label("新規アカウント追加:");
-                    ui.add_space(5.0);
-                    
-                    ui.label("アカウント名:");
-                    ui.text_edit_singleline(&mut self.edit_account_name);
-                    
-                    ui.add_space(5.0);
-                    
-                    ui.label("サーバー (例: misskey.io):");
-                    ui.text_edit_singleline(&mut self.edit_account_host);
-                    
-                    ui.add_space(5.0);
-                    
-                    ui.label("アクセストークン (オプション):");
-                    ui.text_edit_singleline(&mut self.edit_account_token);
-                    
-                    ui.add_space(10.0);
-                    
-                    if ui.button("アカウントを追加").clicked() {
-                        if !self.edit_account_name.is_empty() && !self.edit_account_host.is_empty() {
-                            let new_account = Account {
-                                name: self.edit_account_name.clone(),
-                                host: self.edit_account_host.clone(),
-                                token: if self.edit_account_token.is_empty() { None } else { Some(self.edit_account_token.clone()) },
-                                timeline: TimelineType::default(),
-                            };
-                            self.config.accounts.push(new_account);
-                            self.edit_account_name.clear();
-                            self.edit_account_host.clear();
-                            self.edit_account_token.clear();
-                        }
-                    }
-                    
-                    ui.add_space(10.0);
-                    ui.separator();
-                    
-                    ui.horizontal(|ui| {
-                        if ui.button("保存").clicked() {
-                            if let Err(e) = self.config.save() {
-                                eprintln!("設定の保存に失敗: {}", e);
-                            }
-                        }
-                        
-                        if ui.button("閉じる").clicked() {
-                            self.show_settings = false;
-                            self.selected_account_index = None;
-                            self.edit_account_name.clear();
-                            self.edit_account_host.clear();
-                            self.edit_account_token.clear();
-                        }
-                    });
-                    
-                    ui.add_space(10.0);
-                    ui.separator();
-                    ui.label("ショートカット: Ctrl+S で設定画面を開く/閉じる");
-                });
-        } else {
-            // 設定画面が閉じている時のみクリックスルーを有効化
-            // eguiの入力処理を完全に無効化
-            ctx.input_mut(|i| {
-                i.events.clear();
-                i.pointer = Default::default();
-                i.raw.hovered_files.clear();
-                i.raw.dropped_files.clear();
-            });
-
-            // ウィンドウ設定
-            self.configure_window_clickthrough(frame);
-        }
+        // ウィンドウ設定
+        self.configure_window_clickthrough(frame);
 
         // ダウンロード完了した絵文字を処理
         self.emoji_cache.process_downloads(ctx, debug_mode);
@@ -909,7 +1139,7 @@ impl eframe::App for MisskeyViewerApp {
             comment.x -= comment.speed * 60.0 * dt; // 60fps基準で速度調整
 
             // 描画
-            // 名前(@id)の形式で表示（リノートの場合は元投稿情報も含む）
+            // [アカウント名] 名前(@id)の形式で表示（リノートの場合は元投稿情報も含む）
             let text = if let Some((orig_name, orig_username, orig_host, _)) = &comment.renote_info {
                 // リノートの場合
                 let orig_display = if orig_host.is_empty() {
@@ -922,7 +1152,7 @@ impl eframe::App for MisskeyViewerApp {
                 } else {
                     format!("{}(@{})", comment.name, comment.username)
                 };
-                format!("{}: Rn({}): {}", user_display, orig_display, comment.text)
+                format!("[{}] {}: Rn({}): {}", comment.account_name, user_display, orig_display, comment.text)
             } else {
                 // 通常の投稿
                 let user_display = if let Some(host) = &comment.user_host {
@@ -930,7 +1160,7 @@ impl eframe::App for MisskeyViewerApp {
                 } else {
                     format!("{}(@{})", comment.name, comment.username)
                 };
-                format!("{}: {}", user_display, comment.text)
+                format!("[{}] {}: {}", comment.account_name, user_display, comment.text)
             };
             
             // 絵文字を含むテキストを処理
@@ -1038,6 +1268,13 @@ impl eframe::App for MisskeyViewerApp {
                         if !line.is_empty() {
                             let current_y = comment.y + (current_line as f32 * line_height);
                             
+                            // アカウントの色を取得
+                            let text_color = egui::Color32::from_rgb(
+                                comment.account_color[0],
+                                comment.account_color[1],
+                                comment.account_color[2],
+                            );
+                            
                             // 影
                             painter.text(
                                 egui::pos2(current_x, current_y) + egui::vec2(2.0, 2.0),
@@ -1050,14 +1287,14 @@ impl eframe::App for MisskeyViewerApp {
                             let galley = painter.layout_no_wrap(
                                 line.to_string(),
                                 font_id.clone(),
-                                egui::Color32::WHITE
+                                text_color
                             );
                             painter.text(
                                 egui::pos2(current_x, current_y),
                                 egui::Align2::LEFT_TOP,
                                 line,
                                 font_id.clone(),
-                                egui::Color32::WHITE,
+                                text_color,
                             );
                             current_x += galley.rect.width();
                         }
@@ -1378,13 +1615,9 @@ fn detect_url(text: &str) -> Option<String> {
 }
 
 // OGPメタデータを非同期で取得
-async fn fetch_ogp_metadata(url: &str, debug_mode: bool) -> Option<UrlPreview> {
+async fn fetch_ogp_metadata(url: &str, _debug_mode: bool) -> Option<UrlPreview> {
     use scraper::{Html, Selector};
     use std::time::Duration;
-    
-    if debug_mode {
-        println!("DEBUG: Fetching OGP metadata for: {}", url);
-    }
     
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -1393,10 +1626,6 @@ async fn fetch_ogp_metadata(url: &str, debug_mode: bool) -> Option<UrlPreview> {
         .ok()?;
     
     let response = client.get(url).send().await.ok()?;
-    
-    if debug_mode {
-        println!("DEBUG: HTTP status: {}", response.status());
-    }
     
     let html_content = response.text().await.ok()?;
     let document = Html::parse_document(&html_content);
@@ -1496,11 +1725,6 @@ async fn fetch_ogp_metadata(url: &str, debug_mode: bool) -> Option<UrlPreview> {
         }
     });
     
-    if debug_mode {
-        println!("DEBUG: OGP - title: {:?}, description: {:?}, image: {:?}, site_name: {:?}, favicon: {:?}", 
-                 title, description, image_url, site_name, favicon_url);
-    }
-    
     Some(UrlPreview {
         url: url.to_string(),
         title: title.unwrap_or_else(|| url.to_string()),
@@ -1511,7 +1735,71 @@ async fn fetch_ogp_metadata(url: &str, debug_mode: bool) -> Option<UrlPreview> {
     })
 }
 
+fn run_settings_window() -> Result<(), Box<dyn std::error::Error>> {
+    // 設定読み込み
+    let config = AppConfig::new().unwrap_or_else(|_| AppConfig {
+        accounts: vec![],
+        active_account_index: 0,
+        debug: false,
+        fallback_font: None,
+    });
+    
+    let (reconnect_tx, _reconnect_rx) = tokio::sync::mpsc::unbounded_channel::<AppConfig>();
+    
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([800.0, 600.0])
+            .with_resizable(true)
+            .with_decorations(true)
+            .with_transparent(false),
+        renderer: eframe::Renderer::Glow,
+        ..Default::default()
+    };
+    
+    eframe::run_native(
+        "設定 - Misskey Post Viewer",
+        options,
+        Box::new(move |cc| {
+            // フォント設定
+            let mut fonts = egui::FontDefinitions::default();
+            let font_path = "C:\\Windows\\Fonts\\meiryo.ttc";
+            if std::path::Path::new(font_path).exists() {
+                if let Ok(font_data) = std::fs::read(font_path) {
+                    fonts.font_data.insert(
+                        "my_font".to_owned(),
+                        egui::FontData::from_owned(font_data).tweak(
+                            egui::FontTweak {
+                                scale: 1.0,
+                                ..Default::default()
+                            }
+                        ).into(),
+                    );
+                    fonts.families
+                        .entry(egui::FontFamily::Proportional)
+                        .or_default()
+                        .insert(0, "my_font".to_owned());
+                    fonts.families
+                        .entry(egui::FontFamily::Monospace)
+                        .or_default()
+                        .insert(0, "my_font".to_owned());
+                }
+            }
+            cc.egui_ctx.set_fonts(fonts);
+            
+            Ok(Box::new(SettingsWindowApp::new(config, reconnect_tx)))
+        }),
+    )?;
+    
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // コマンドライン引数をチェック
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "--settings" {
+        return run_settings_window();
+    }
+    
     // トレイアイコンのメニュー作成
     let tray_menu = Menu::new();
     let settings_item = MenuItem::with_id("settings", "設定", true, None);
@@ -1588,12 +1876,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("Failed to load configuration: {}", e);
             eprintln!("Using default configuration (misskey.io)");
             AppConfig {
-                accounts: vec![Account {
-                    name: "Default".to_string(),
-                    host: "misskey.io".to_string(),
-                    token: None,
-                    timeline: TimelineType::default(),
-                }],
+                accounts: vec![Account::new(
+                    "Default".to_string(),
+                    "misskey.io".to_string(),
+                    None,
+                    TimelineType::default(),
+                    true,
+                    [255, 255, 255],
+                )],
                 active_account_index: 0,
                 debug: false,
                 fallback_font: None,
